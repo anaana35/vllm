@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, ANY, TypeVar
 
 import torch
 
@@ -232,6 +232,257 @@ class MinTokensLogitsProcessor(LogitsProcessor):
             logits[self.logits_slice] = -float("inf")
         return logits
 
+class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
+    """Natural thinking termination with soft cutoff using gradual probability adjustment."""
+
+    def __init__(
+        self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
+    ):
+        reasoning_config = vllm_config.reasoning_config
+        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+
+        self.is_enabled = (
+            reasoning_config is not None and reasoning_config.is_thinking_enabled()
+        )
+
+        self.think_end_token_ids = getattr(reasoning_config, "think_end_token_ids", [])
+        self.think_start_token_ids = getattr(reasoning_config, "think_start_token_ids", [])
+        
+        self.soft_cutoff_start = 0.7
+        self.soft_cutoff_end = 1.2
+        self.max_prob_boost = 5.0
+        self.min_prob_boost = 0.1
+        
+        self.device = device
+        self._state: dict[int, dict[str, Any]] = {}
+
+    def _calculate_probability_boost(self, state: dict[str, Any]) -> float:
+        if not state.get("in_think", False):
+            return 0.0
+            
+        think_count = state.get("think_count", 0)
+        budget = state.get("thinking_token_budget", 100)
+        
+        used_ratio = think_count / budget
+        
+        if used_ratio < 1.0:
+            return 0.0
+            
+        if used_ratio <= 1.0:
+            transition_range = 1.0 - self.soft_cutoff_start
+            normalized_ratio = (used_ratio - self.soft_cutoff_start) / transition_range
+            
+            smooth_ratio = self._smooth_transition(normalized_ratio)
+            boost = self.min_prob_boost + smooth_ratio * (self.max_prob_boost - self.min_prob_boost)
+            return boost
+            
+        else:
+            if used_ratio <= self.soft_cutoff_end:
+                over_budget_ratio = (used_ratio - 1.0) / (self.soft_cutoff_end - 1.0)
+                strong_boost = self.max_prob_boost + (over_budget_ratio * self.max_prob_boost * 0.5)
+                return strong_boost
+            else:
+                return self.max_prob_boost * 2.0
+
+    def _smooth_transition(self, x: float) -> float:
+        if x <= 0:
+            return 0
+        elif x >= 1:
+            return 1
+        else:
+            return 3 * x ** 2 - 2 * x ** 3
+
+    def _calculate_dynamic_threshold(self, state: dict[str, Any]) -> tuple[float, float]:
+        think_count = state.get("think_count", 0)
+        budget = state.get("thinking_token_budget", 100)
+        
+        base_start = self.soft_cutoff_start
+        base_end = self.soft_cutoff_end
+        
+        output_tokens = state.get("output_tok_ids", [])
+        if len(output_tokens) > 10:
+            recent_tokens = output_tokens[-10:]
+            if len(set(recent_tokens)) < 5:
+                return base_start * 0.9, base_end * 0.95
+        
+        return base_start, base_end
+
+    @staticmethod
+    def _find_last_sequence_index(target_list: list[int], token_ids: list[int]) -> int:
+        """
+        Returns the index of the last occurrence of token_ids in target_list.
+        Args:
+          target_list (list[int]): The list of token IDs.
+          token_ids (list[int]): The sequence of token IDs to find.
+        """
+        if not token_ids:
+            return -1
+        for i in range(len(target_list) - len(token_ids), -1, -1):
+            if target_list[i : i + len(token_ids)] == token_ids:
+                return i
+        return -1
+
+    def _init_state_entry(
+        self, prompt_tok_ids: Optional[list[int]], thinking_token_budget: int
+    ) -> dict[str, Any]:
+        """Initializes the tracking state for a given sequence index."""
+        if prompt_tok_ids is None:
+            last_start = -1
+            last_end = -1
+            in_think = False
+            think_count = 0
+        else:
+            last_start = self._find_last_sequence_index(
+                prompt_tok_ids, self.think_start_token_ids
+            )
+            last_end = self._find_last_sequence_index(
+                prompt_tok_ids, self.think_end_token_ids
+            )
+            in_think = last_start > last_end
+            if in_think:
+                think_count = len(prompt_tok_ids) - (
+                    last_start + len(self.think_start_token_ids)
+                )
+            else:
+                think_count = 0
+
+        return {
+            "in_think": in_think,  # Currently in thinking mode
+            "in_end": False,
+            # "check_count_down": thinking_token_budget,
+            "think_count": think_count,  # Number of tokens in thinking section
+            "end_count": 0,  # Number of end tokens forced so far
+            "prompt_tok_ids": prompt_tok_ids,
+            "output_tok_ids": [],
+            "thinking_token_budget": thinking_token_budget,
+            "prev_output_length": 0,
+            # Track previous output length for incremental updates
+        }
+
+    def _update_think_state(self, state: dict[str, Any]):
+        """Updates the state based on newly generated output tokens."""
+        # if not state.get("in_end", False) and state.get("check_count_down", 0) > 0:
+        #     # state["check_count_down"] -= 1
+        #     return
+
+        output = state.get("output_tok_ids", [])
+        if not output:
+            return
+
+        # Track previous output length for incremental processing
+        prev_length = state.get("prev_output_length", 0)
+        current_length = len(output)
+
+        if current_length <= prev_length:
+            return
+
+        # Process only newly added tokens
+        new_tokens = output[prev_length:]
+        state["prev_output_length"] = current_length
+
+        # Check if new tokens contain think start or end sequences
+        start_len = len(self.think_start_token_ids)
+        end_len = len(self.think_end_token_ids)
+
+        # Look for think sequences in recent tokens (including boundary)
+        # Check overlapping regions where sequences might span boundaries
+        check_start_idx = max(0, prev_length - max(start_len, end_len) + 1)
+        recent_tokens = output[check_start_idx:]
+
+        # Find any think start/end sequences in recent tokens
+        recent_start_pos = self._find_last_sequence_index(
+            recent_tokens, self.think_start_token_ids
+        )
+        recent_end_pos = self._find_last_sequence_index(
+            recent_tokens, self.think_end_token_ids
+        )
+
+
+        if recent_start_pos >= 0 and recent_end_pos >= 0:
+            if recent_start_pos > recent_end_pos:
+                # Case: ...<end>...<start>... - entering think mode
+                absolute_start_pos = check_start_idx + recent_start_pos
+                new_think_count = current_length - (absolute_start_pos + start_len)
+                state["in_think"] = True
+                state["think_count"] = new_think_count
+            else:
+                # Case: ...<start>...<end>... - exiting think mode
+                state["in_think"] = False
+                state["in_end"] = True
+                # state["think_count"] = 0
+        elif recent_start_pos >= 0:
+            # Found think start - entering think mode
+            absolute_start_pos = check_start_idx + recent_start_pos
+            new_think_count = current_length - (absolute_start_pos + start_len)
+            state["in_think"] = True
+            state["think_count"] = new_think_count
+        elif recent_end_pos >= 0:
+            # Found think end - exiting think mode
+            state["in_think"] = False
+            state["in_end"] = True
+            # state["think_count"] = 0
+        elif state["in_think"]:
+            # Continue thinking mode, increment count by new tokens
+            state["think_count"] += len(new_tokens)
+
+    def update_state(self, batch_update: Optional[BatchUpdate]):
+        if not self.is_enabled:
+            return
+
+        if batch_update:
+            for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
+                thinking_token_budget = params.thinking_token_budget
+
+                if thinking_token_budget is not None:
+                    self._state[index] = self._init_state_entry(
+                        prompt_tok_ids, thinking_token_budget
+                    )
+                    self._state[index]["output_tok_ids"] = output_tok_ids
+                else:
+                    self._state.pop(index, None)
+
+            for index in batch_update.removed:
+                self._state.pop(index, {})
+
+            for i1, i2, direction in batch_update.moved:
+                if direction == MoveDirectionality.SWAP:
+                    state1 = self._state.get(i1, {})
+                    state2 = self._state.get(i2, {})
+                    if state1 or state2:
+                        self._state[i1] = state2
+                        self._state[i2] = state1
+                else:
+                    self._state[i2] = self._state.pop(i1, {})
+
+        for state in self._state.values():
+            self._update_think_state(state)
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.is_enabled or not self._state:
+            return logits
+
+        batch_size = logits.size(0)
+
+        for i in range(batch_size):
+            state = self._state.get(i)
+            if state and state.get("in_think", False):
+                boost = self._calculate_probability_boost(state)
+                if boost > 0 and self.think_end_token_ids:
+                    # 为所有结束token平滑增加概率
+                    for end_token in self.think_end_token_ids:
+                        # # 平滑调整，避免突变
+                        # adjusted_boost = min(boost, self.max_prob_boost * 3)  # 设置上限
+                        # logits[i, end_token] += adjusted_boost
+                        logits[i, end_token] = math.exp(logits[i, end_token])
+                        # print("testinggggggggg")
+                        # logits[i, end_token] = 1e9
+            # if state and not state.get("in_think", False) and len(state.get("output_tok_ids", [])):                
+            #     for think_token in self.think_start_token_ids:
+            #         logits[i, think_token] = -1e9
+        return logits
+
+    def is_argmax_invariant(self) -> bool:
+        return False
 
 def process_dict_updates(
     req_entries: dict[int, T],
